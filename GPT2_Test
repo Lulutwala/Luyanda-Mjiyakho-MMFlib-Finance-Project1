@@ -1,0 +1,3 @@
+long_term_forecast_Public_Health_GPT2_Informer_custom_ftS_sl24_ll12_pl24_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_GPT2_run_0  
+mse:1.2737818956375122, mae:0.7980022430419922, rmse:1.1286194324493408, mape:3.7524325847625732, mspe:327.166748046875
+

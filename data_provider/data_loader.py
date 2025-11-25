@@ -65,7 +65,12 @@ class Dataset_Custom(Dataset):
         else:
             print("!!!!!!!!!!!!Using output of closed source llm and Bert as encoder!!!!!!!!!!!!!!!")
             text_name="Final_Output"
-        df_raw = df_raw[['date'] + cols + [self.target]+['prior_history_avg']+['start_date']+['end_date']+[text_name]]
+        columns_to_use = ['date'] + cols + [self.target] + ['prior_history_avg', 'start_date', 'end_date']
+        if text_name in df_raw.columns:
+            columns_to_use.append(text_name)
+
+        df_raw = df_raw[columns_to_use]
+
         num_train = int(len(df_raw) * 0.7)
         num_test = int(len(df_raw) * 0.2)
         num_vali = len(df_raw) - num_train - num_test
@@ -111,7 +116,10 @@ class Dataset_Custom(Dataset):
         self.date=df_raw[['date']][border1:border2].values
         self.start_date=df_raw[['start_date']][border1:border2].values
         self.end_date=df_raw[['end_date']][border1:border2].values
-        self.text=df_raw[[text_name]][border1:border2].values
+        if text_name in df_raw.columns:
+            self.text = df_raw[[text_name]][border1:border2].values
+        else:
+            self.text = np.empty((border2 - border1, 0))
     def get_prior_y(self, indices):
         if isinstance(indices, torch.Tensor):
             indices = indices.numpy()

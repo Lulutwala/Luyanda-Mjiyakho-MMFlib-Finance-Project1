@@ -110,7 +110,6 @@ if __name__ == '__main__':
     parser.add_argument('--p_hidden_layers', type=int, default=2, help='number of hidden layers in projector')
 
     #  new pars
-    parser.add_argument('--llm_model', type=str, default='BERT', help='LLM model') # LLAMA2, LLAMA3, GPT2, BERT, GPT2M, GPT2L, GPT2XL, Doc2Vec, ClosedLLM
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
     parser.add_argument('--llm_layers', type=int, default=6)
     parser.add_argument('--text_path', type=str, default="None")
@@ -128,7 +127,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_name', type=str, default='result_longterm_forecast', help='save name')
     parser.add_argument('--use_fullmodel', type=int, default=0, help='use full model or just encoder')
     parser.add_argument('--use_closedllm', type=int, default=0, help='use closedllm or not')    
-    parser.add_argument('--huggingface_token', type=str, help='your token of huggingface;need for llama3')
+    parser.add_argument('--llm_model', type=str, default=None, help='Large Language Model to use, e.g., gpt2')
+    parser.add_argument('--huggingface_token', type=str, default=None, help='HuggingFace token to access models')
     args = parser.parse_args()
     domain= re.search(r'/([^/]+)$', args.root_path).group(1)
     print("now running on domain {} model {} ".format(domain,args.model))

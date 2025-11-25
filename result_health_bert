@@ -1,0 +1,15 @@
+long_term_forecast_Public_Health_2021_24_12_fullLLM_0_Informer_custom_ftS_sl24_ll12_pl12_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0  
+mse:1.0050536394119263, mae:0.6703832745552063, rmse:1.00252366065979, mape:3.304553985595703, mspe:304.2435607910156
+
+long_term_forecast_Public_Health_2021_24_24_fullLLM_0_Informer_custom_ftS_sl24_ll12_pl24_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0  
+mse:1.234999656677246, mae:0.7630562782287598, rmse:1.1113053560256958, mape:3.2578542232513428, mspe:213.2752685546875
+
+long_term_forecast_Public_Health_2021_24_36_fullLLM_0_Informer_custom_ftS_sl24_ll12_pl36_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0  
+mse:1.5725493431091309, mae:0.823836088180542, rmse:1.2540132999420166, mape:2.497572183609009, mspe:107.0394287109375
+
+long_term_forecast_Public_Health_2021_24_48_fullLLM_0_Informer_custom_ftS_sl24_ll12_pl48_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0  
+mse:1.725817322731018, mae:0.8921791911125183, rmse:1.3137036561965942, mape:2.8343188762664795, mspe:173.58006286621094
+
+long_term_forecast_Public_Health_2021_24_12_fullLLM_0_Reformer_custom_ftS_sl24_ll12_pl12_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_Exp_0  
+mse:1.1937031745910645, mae:0.7475870251655579, rmse:1.0925672054290771, mape:2.847672462463379, mspe:168.2474822998047
+
