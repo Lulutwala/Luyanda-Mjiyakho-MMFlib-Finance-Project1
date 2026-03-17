@@ -1,3 +1,4 @@
 exp/exp_long_term_forecasting.py
 exp/exp_long_term_forecasting.py
 checkpoints/
+data/News/financial_news_monthly_2015_to_current.csv
