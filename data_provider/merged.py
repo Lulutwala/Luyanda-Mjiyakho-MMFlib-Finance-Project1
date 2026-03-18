@@ -3,16 +3,12 @@ import re
 import numpy as np
 import pandas as pd
 
-# ============================================================
-# CONFIG
-# ============================================================
 PROJECT_ROOT = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1"
 
 STOCK_FILE = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1\data\Economy\mmflib_stock_features.csv"
 NEWS_FILE = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1\data\News\financial_news_monthly_2015_to_current.csv"
 OUTPUT_FILE = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1\data\merged_stock_news_dataset.csv"
 
-# Change these if your stock CSV uses different column names
 STOCK_DATE_COL = "date"
 STOCK_TICKER_COL = "ticker"
 STOCK_OPEN_COL = "open"
@@ -24,9 +20,7 @@ STOCK_VOLUME_COL = "volume"
 NEWS_DATE_COL = "published_at"
 NEWS_TICKER_COL = "ticker"
 
-# ============================================================
-# HELPERS
-# ============================================================
+
 def normalize_ticker(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.upper()
 
@@ -46,9 +40,7 @@ def safe_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# 1. CLEAN STOCK DATA
-# ============================================================
+
 def load_and_clean_stock_data(stock_file: str) -> pd.DataFrame:
     stock = pd.read_csv(stock_file)
 
@@ -99,9 +91,6 @@ def load_and_clean_stock_data(stock_file: str) -> pd.DataFrame:
     return stock
 
 
-# ============================================================
-# 2. CLEAN NEWS DATA
-# ============================================================
 def load_and_clean_news_data(news_file: str) -> pd.DataFrame:
     news = pd.read_csv(news_file)
 
@@ -139,10 +128,6 @@ def load_and_clean_news_data(news_file: str) -> pd.DataFrame:
 
     return news
 
-
-# ============================================================
-# 3. AGGREGATE NEWS PER TICKER-DAY
-# ============================================================
 def aggregate_news_per_ticker_day(news: pd.DataFrame) -> pd.DataFrame:
     def combine_text(series: pd.Series) -> str:
         texts = [clean_text(x) for x in series if clean_text(x)]
@@ -173,10 +158,6 @@ def aggregate_news_per_ticker_day(news: pd.DataFrame) -> pd.DataFrame:
 
     return grouped
 
-
-# ============================================================
-# 4. MERGE WITH STOCK DATA
-# ============================================================
 def merge_stock_and_news(stock: pd.DataFrame, news_daily: pd.DataFrame) -> pd.DataFrame:
     merged = stock.merge(
         news_daily,
@@ -202,10 +183,6 @@ def merge_stock_and_news(stock: pd.DataFrame, news_daily: pd.DataFrame) -> pd.Da
 
     return merged
 
-
-# ============================================================
-# 5. CREATE TARGET
-# ============================================================
 def create_targets(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.sort_values([STOCK_TICKER_COL, STOCK_DATE_COL]).reset_index(drop=True)
@@ -219,9 +196,6 @@ def create_targets(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# MAIN PIPELINE
-# ============================================================
 def build_merged_dataset():
     print("Loading stock data...")
     stock = load_and_clean_stock_data(STOCK_FILE)
