@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -6,20 +8,24 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    roc_auc_score,
+)
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 from transformers import GPT2Model, GPT2Tokenizer
 
 
-DEFAULT_DATA_PATH = (
-    r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1"
-    r"\data\merged\merged_stock_news_dataset.csv"
-)
+DEFAULT_DATA_PATH = "/home/mjiyakho/MM-TSFlib/data/merged/merged_stock_news_dataset.csv"
 
 DATE_COL = "date"
 TICKER_COL = "ticker"
 TARGET_COL = "target_next_return"
+CLASS_TARGET_COL = "target_up_down"
 TEXT_COLS = ["all_headlines", "all_summaries", "all_news_text"]
 
 EXCLUDE_COLS = {
@@ -59,9 +65,14 @@ def load_dataset(path: str, max_rows: int | None = None) -> pd.DataFrame:
     if max_rows is not None and max_rows > 0:
         df = df.iloc[:max_rows].copy()
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    df = df.dropna(subset=[DATE_COL, TARGET_COL]).copy()
     df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
-    df = df.dropna(subset=[TARGET_COL])
+    if CLASS_TARGET_COL in df.columns:
+        df[CLASS_TARGET_COL] = pd.to_numeric(df[CLASS_TARGET_COL], errors="coerce")
+    else:
+        # Fallback for datasets that do not already include a binary class label.
+        df[CLASS_TARGET_COL] = (df[TARGET_COL] >= 0).astype(np.float32)
+    df = df.dropna(subset=[DATE_COL, TARGET_COL, CLASS_TARGET_COL]).copy()
+    df[CLASS_TARGET_COL] = (df[CLASS_TARGET_COL] > 0).astype(np.float32)
     df = df.sort_values([DATE_COL, TICKER_COL]).reset_index(drop=True)
     return df
 
@@ -173,6 +184,77 @@ class Regressor(nn.Module):
         return self.net(x)
 
 
+class Classifier(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def train_nn_classifier(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    device: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+) -> tuple[dict, Classifier]:
+    model = Classifier(X_train.shape[1]).to(device)
+
+    pos_count = float(np.sum(y_train > 0.5))
+    neg_count = float(len(y_train) - pos_count)
+    if pos_count > 0:
+        pos_weight = torch.tensor([neg_count / pos_count], dtype=torch.float32, device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        loss_fn = nn.BCEWithLogitsLoss()
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+
+    for epoch in range(1, epochs + 1):
+        perm = torch.randperm(X_train_t.size(0), device=device)
+        losses = []
+        for i in range(0, len(perm), batch_size):
+            idx = perm[i : i + batch_size]
+            xb = X_train_t[idx]
+            yb = y_train_t[idx]
+
+            opt.zero_grad()
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            opt.step()
+            losses.append(float(loss.item()))
+
+        print(f"  Epoch {epoch:02d}/{epochs} | cls_train_loss={np.mean(losses):.6f}")
+
+    with torch.no_grad():
+        logits = model(torch.tensor(X_test, dtype=torch.float32).to(device)).cpu().numpy().reshape(-1)
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    preds = (probs >= 0.5).astype(int)
+    y_true = y_test.astype(int)
+
+    cls_metrics = {
+        "accuracy": float(accuracy_score(y_true, preds)),
+        "f1": float(f1_score(y_true, preds, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, probs)) if np.unique(y_true).size > 1 else float("nan"),
+    }
+    return cls_metrics, model
+
+
 def train_nn_regressor(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -265,19 +347,34 @@ def main():
         save_cached_embeddings(args.output_dir, text_embs)
         print("Saved GPT-2 embeddings cache.")
 
-    y = df[TARGET_COL].astype(float).to_numpy()
+    y_reg = df[TARGET_COL].astype(float).to_numpy()
+    y_cls = df[CLASS_TARGET_COL].astype(np.float32).to_numpy()
 
-    print("\nTraining model: gpt2_only")
+    print("\nTraining model: gpt2_only (classification)")
     X_text_train = text_embs[split.train_idx]
     X_text_test = text_embs[split.test_idx]
-    y_train = y[split.train_idx]
-    y_test = y[split.test_idx]
+    y_cls_train = y_cls[split.train_idx]
+    y_cls_test = y_cls[split.test_idx]
+    y_reg_train = y_reg[split.train_idx]
+    y_reg_test = y_reg[split.test_idx]
 
+    gpt2_cls_metrics, gpt2_cls_model = train_nn_classifier(
+        X_train=X_text_train,
+        y_train=y_cls_train,
+        X_test=X_text_test,
+        y_test=y_cls_test,
+        device=device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+    )
+
+    print("\nTraining model: gpt2_only (regression secondary)")
     gpt2_metrics, gpt2_model = train_nn_regressor(
         X_train=X_text_train,
-        y_train=y_train,
+        y_train=y_reg_train,
         X_test=X_text_test,
-        y_test=y_test,
+        y_test=y_reg_test,
         device=device,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -298,12 +395,24 @@ def main():
     X_mmf_train = np.hstack([X_num_train, X_text_train]).astype(np.float32)
     X_mmf_test = np.hstack([X_num_test, X_text_test]).astype(np.float32)
 
-    print("\nTraining model: mmflib_fusion")
+    print("\nTraining model: mmflib_fusion (classification)")
+    mmf_cls_metrics, mmf_cls_model = train_nn_classifier(
+        X_train=X_mmf_train,
+        y_train=y_cls_train,
+        X_test=X_mmf_test,
+        y_test=y_cls_test,
+        device=device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+    )
+
+    print("\nTraining model: mmflib_fusion (regression secondary)")
     mmf_metrics, mmf_model = train_nn_regressor(
         X_train=X_mmf_train,
-        y_train=y_train,
+        y_train=y_reg_train,
         X_test=X_mmf_test,
-        y_test=y_test,
+        y_test=y_reg_test,
         device=device,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -312,6 +421,20 @@ def main():
 
     metrics_df = pd.DataFrame(
         [
+            {"model": "gpt2_only", **{f"cls_{k}": v for k, v in gpt2_cls_metrics.items()}, **{f"reg_{k}": v for k, v in gpt2_metrics.items()}},
+            {"model": "mmflib_fusion", **{f"cls_{k}": v for k, v in mmf_cls_metrics.items()}, **{f"reg_{k}": v for k, v in mmf_metrics.items()}},
+        ]
+    ).sort_values(["cls_roc_auc", "cls_f1"], ascending=False)
+
+    cls_df = pd.DataFrame(
+        [
+            {"model": "gpt2_only", **gpt2_cls_metrics},
+            {"model": "mmflib_fusion", **mmf_cls_metrics},
+        ]
+    ).sort_values(["roc_auc", "f1"], ascending=False)
+
+    reg_df = pd.DataFrame(
+        [
             {"model": "gpt2_only", **gpt2_metrics},
             {"model": "mmflib_fusion", **mmf_metrics},
         ]
@@ -319,16 +442,30 @@ def main():
 
     metrics_path = os.path.join(args.output_dir, "gpt2_mmflib_metrics.csv")
     metrics_df.to_csv(metrics_path, index=False)
+    cls_metrics_path = os.path.join(args.output_dir, "gpt2_mmflib_classification_metrics.csv")
+    reg_metrics_path = os.path.join(args.output_dir, "gpt2_mmflib_regression_metrics.csv")
+    cls_df.to_csv(cls_metrics_path, index=False)
+    reg_df.to_csv(reg_metrics_path, index=False)
 
+    torch.save(gpt2_cls_model.state_dict(), os.path.join(args.output_dir, "gpt2_only_classifier_model.pt"))
+    torch.save(mmf_cls_model.state_dict(), os.path.join(args.output_dir, "mmflib_fusion_classifier_model.pt"))
     torch.save(gpt2_model.state_dict(), os.path.join(args.output_dir, "gpt2_only_model.pt"))
     torch.save(mmf_model.state_dict(), os.path.join(args.output_dir, "mmflib_fusion_model.pt"))
-    np.save(os.path.join(args.output_dir, "target_test.npy"), y_test)
+    np.save(os.path.join(args.output_dir, "target_test.npy"), y_reg_test)
+    np.save(os.path.join(args.output_dir, "target_up_down_test.npy"), y_cls_test)
     with open(os.path.join(args.output_dir, "numeric_features.json"), "w", encoding="utf-8") as f:
         json.dump(numeric_features, f, indent=2)
 
     print("\nResults:")
+    print("\nClassification (primary):")
+    print(cls_df.to_string(index=False))
+    print("\nRegression (secondary):")
+    print(reg_df.to_string(index=False))
+    print("\nCombined summary:")
     print(metrics_df.to_string(index=False))
     print(f"\nSaved metrics: {metrics_path}")
+    print(f"Saved classification metrics: {cls_metrics_path}")
+    print(f"Saved regression metrics: {reg_metrics_path}")
     print(f"Saved artifacts in: {args.output_dir}")
 
 

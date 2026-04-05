@@ -1,3 +1,4 @@
+import argparse
 import os
 import csv
 import json
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 # =========================
 # LOAD ENV
 # =========================
-ENV_PATH = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1\.env"
+ENV_PATH = "/home/mjiyakho/MM-TSFlib/.env"
 load_dotenv(ENV_PATH)
 
 API_KEY = os.getenv("API_KEY")
@@ -23,7 +24,7 @@ if not API_KEY or not API_SECRET:
 # =========================
 # PATHS
 # =========================
-PROJECT_ROOT = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1"
+PROJECT_ROOT = "/home/mjiyakho/MM-TSFlib"
 SYMBOL_CSV_PATH = os.path.join(PROJECT_ROOT, "nasdaq-listed-symbols.csv")
 SAVE_FOLDER = os.path.join(PROJECT_ROOT, "data", "News")
 
@@ -67,6 +68,13 @@ CSV_COLUMNS = [
 # =========================
 def ensure_folder() -> None:
     os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+
+def reset_backfill_state() -> None:
+    for path in (OUTPUT_CSV, CHECKPOINT_FILE, SEEN_FILE):
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"Removed: {path}")
 
 
 def normalize_text(value) -> str:
@@ -298,8 +306,13 @@ def process_chunk(symbol_chunk: list[str], start_iso: str, end_iso: str) -> dict
 # =========================
 # MAIN
 # =========================
-def run_optimized_backfill() -> None:
+def run_optimized_backfill(from_scratch: bool = False) -> None:
     ensure_folder()
+
+    if from_scratch:
+        print("Starting from scratch. Clearing output, checkpoint, and seen keys...")
+        reset_backfill_state()
+
     ensure_output_csv()
 
     symbols = load_symbols_from_csv(SYMBOL_CSV_PATH)
@@ -378,5 +391,16 @@ def run_optimized_backfill() -> None:
     print(f"Saved file:\n{OUTPUT_CSV}")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Backfill Alpaca news data by monthly windows.")
+    parser.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="Delete output/checkpoint/seen files and backfill again from START_DATE.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    run_optimized_backfill()
+    args = parse_args()
+    run_optimized_backfill(from_scratch=args.from_scratch)
