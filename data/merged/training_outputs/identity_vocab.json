@@ -1,0 +1,19 @@
+{
+  "ticker": {
+    "AAPL": 0,
+    "AMZN": 1,
+    "GOOGL": 2,
+    "JPM": 3,
+    "MSFT": 4,
+    "NVDA": 5,
+    "V": 6
+  },
+  "sector": {
+    "UNKNOWN": 0
+  },
+  "market_cap_bucket": {
+    "large": 0,
+    "mid": 1,
+    "small": 2
+  }
+}

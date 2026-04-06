@@ -1,0 +1,19 @@
+{
+  "data_path": "/home/mjiyakho/MM-TSFlib/data/merged/merged_stock_news_dataset.csv",
+  "output_dir": "data/merged/training_outputs",
+  "max_rows": 0,
+  "seed": 42,
+  "walk_splits": 5,
+  "min_train_ratio": 0.6,
+  "epochs": 10,
+  "batch_size": 256,
+  "lr": 0.0008,
+  "news_encoder": "both",
+  "finbert_model_name": "ProsusAI/finbert",
+  "embed_batch_size": 16,
+  "embed_max_length": 96,
+  "local_files_only": false,
+  "ticker_meta_path": "",
+  "use_identity_features": true,
+  "ablations": "numeric_only,news_only,fusion"
+}

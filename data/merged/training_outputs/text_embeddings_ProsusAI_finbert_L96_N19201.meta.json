@@ -1,0 +1,6 @@
+{
+  "n_rows": 19201,
+  "dim": 768,
+  "encoder_key": "ProsusAI_finbert",
+  "max_length": 96
+}
