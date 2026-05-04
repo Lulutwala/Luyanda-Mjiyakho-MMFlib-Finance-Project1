@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
+
+try:
+    import torch
+except ImportError as exc:
+    fallback_torch_site = os.environ.get(
+        "MMTSFLIB_TORCH_SITE",
+        "/home/mjiyakho/torch_env/lib/python3.10/site-packages",
+    )
+    if os.path.exists(os.path.join(fallback_torch_site, "torch")):
+        for module_name in list(sys.modules):
+            if module_name == "torch" or module_name.startswith("torch."):
+                del sys.modules[module_name]
+        sys.path.insert(0, fallback_torch_site)
+        try:
+            import torch
+        except ImportError:
+            raise exc
+    else:
+        raise
 from torch import nn
-from transformers import AutoModel, AutoTokenizer, GPT2Model, GPT2Tokenizer
 
 
 DEFAULT_DATA_PATH = "/home/mjiyakho/MM-TSFlib/data/merged/merged_stock_news_dataset.csv"
@@ -240,7 +259,9 @@ def print_and_save_news_coverage(coverage: pd.DataFrame, output_dir: str) -> Non
     )
 
     coverage_path = os.path.join(output_dir, "rolling_news_coverage_by_ticker.csv")
+    row_coverage_path = os.path.join(output_dir, "rolling_news_coverage_rows.csv")
     by_ticker.to_csv(coverage_path, index=False)
+    coverage.reset_index().rename(columns={"index": "row_idx"}).to_csv(row_coverage_path, index=False)
 
     print(
         "Rolling news coverage: "
@@ -252,6 +273,15 @@ def print_and_save_news_coverage(coverage: pd.DataFrame, output_dir: str) -> Non
     print("Lowest coverage tickers:")
     print(by_ticker.head(10).to_string(index=False))
     print(f"Saved news coverage: {coverage_path}")
+    print(f"Saved row-level news coverage: {row_coverage_path}")
+
+
+def texts_fingerprint(texts: list[str]) -> str:
+    digest = hashlib.sha256()
+    for text in texts:
+        digest.update(str(text).encode("utf-8", errors="ignore"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def embedding_cache_paths(
@@ -273,6 +303,7 @@ def load_cached_embeddings(
     encoder_key: str,
     max_length: int,
     cache_prefix: str = "text_embeddings",
+    cache_metadata: dict | None = None,
 ) -> np.ndarray | None:
     emb_path, meta_path = embedding_cache_paths(output_dir, n_rows, encoder_key, max_length, cache_prefix)
     if not (os.path.exists(emb_path) and os.path.exists(meta_path)):
@@ -282,6 +313,10 @@ def load_cached_embeddings(
             meta = json.load(f)
         if meta.get("n_rows") != n_rows:
             return None
+        if cache_metadata:
+            for key, value in cache_metadata.items():
+                if meta.get(key) != value:
+                    return None
         return np.load(emb_path)
     except Exception:
         return None
@@ -293,21 +328,21 @@ def save_cached_embeddings(
     max_length: int,
     embs: np.ndarray,
     cache_prefix: str = "text_embeddings",
+    cache_metadata: dict | None = None,
 ) -> None:
     emb_path, meta_path = embedding_cache_paths(output_dir, embs.shape[0], encoder_key, max_length, cache_prefix)
     np.save(emb_path, embs)
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "n_rows": int(embs.shape[0]),
-                "dim": int(embs.shape[1]),
-                "encoder_key": encoder_key,
-                "max_length": int(max_length),
-                "cache_prefix": cache_prefix,
-            },
-            f,
-            indent=2,
-        )
+        meta = {
+            "n_rows": int(embs.shape[0]),
+            "dim": int(embs.shape[1]),
+            "encoder_key": encoder_key,
+            "max_length": int(max_length),
+            "cache_prefix": cache_prefix,
+        }
+        if cache_metadata:
+            meta.update(cache_metadata)
+        json.dump(meta, f, indent=2)
 
 
 def embed_text_with_model(
@@ -350,6 +385,7 @@ def build_news_embeddings(
     local_files_only: bool,
     output_dir: str,
     cache_prefix: str = "text_embeddings",
+    cache_metadata: dict | None = None,
 ) -> np.ndarray:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -357,27 +393,31 @@ def build_news_embeddings(
     finbert_key = safe_slug(finbert_model_name)
 
     def get_gpt2_embs() -> np.ndarray:
-        cached = load_cached_embeddings(output_dir, len(texts), gpt2_key, max_length, cache_prefix)
+        cached = load_cached_embeddings(output_dir, len(texts), gpt2_key, max_length, cache_prefix, cache_metadata)
         if cached is not None:
             print("Using cached GPT-2 embeddings.")
             return cached
+        from transformers import GPT2Model, GPT2Tokenizer
+
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2", local_files_only=local_files_only)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         model = GPT2Model.from_pretrained("gpt2", local_files_only=local_files_only).to(device)
         embs = embed_text_with_model(texts, tokenizer, model, device, batch_size, max_length, "gpt2")
-        save_cached_embeddings(output_dir, gpt2_key, max_length, embs, cache_prefix)
+        save_cached_embeddings(output_dir, gpt2_key, max_length, embs, cache_prefix, cache_metadata)
         return embs
 
     def get_finbert_embs() -> np.ndarray:
-        cached = load_cached_embeddings(output_dir, len(texts), finbert_key, max_length, cache_prefix)
+        cached = load_cached_embeddings(output_dir, len(texts), finbert_key, max_length, cache_prefix, cache_metadata)
         if cached is not None:
             print(f"Using cached {finbert_model_name} embeddings.")
             return cached
+        from transformers import AutoModel, AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(finbert_model_name, local_files_only=local_files_only)
         model = AutoModel.from_pretrained(finbert_model_name, local_files_only=local_files_only).to(device)
         embs = embed_text_with_model(texts, tokenizer, model, device, batch_size, max_length, "finbert")
-        save_cached_embeddings(output_dir, finbert_key, max_length, embs, cache_prefix)
+        save_cached_embeddings(output_dir, finbert_key, max_length, embs, cache_prefix, cache_metadata)
         return embs
 
     if news_encoder == "gpt2":
@@ -831,8 +871,10 @@ def train_panel_classifier(
                 {
                     "date": date,
                     "ticker": ticker,
+                    "target_up_down": int(y_panel[local_i, ticker_i]),
                     "y_true": int(y_panel[local_i, ticker_i]),
                     "prob_up": prob,
+                    "up_down": int(prob >= threshold),
                     "pred_up_down": int(prob >= threshold),
                 }
             )
@@ -895,6 +937,9 @@ def main() -> None:
     folds = build_walk_forward_splits(df, n_splits=args.walk_splits, min_train_ratio=args.min_train_ratio)
     print(f"Walk-forward folds: {len(folds)}")
 
+    ablations = parse_ablations(args.ablations)
+    needs_news_embeddings = any(ablation in {"news_only", "fusion"} for ablation in ablations)
+
     print("Preparing rolling news windows...")
     rolling_texts, coverage = compose_rolling_news_texts(
         df,
@@ -905,21 +950,32 @@ def main() -> None:
         df[col] = coverage[col].to_numpy()
     print_and_save_news_coverage(coverage, args.output_dir)
 
-    print("Preparing rolling news embeddings...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
-    text_embs = build_news_embeddings(
-        texts=rolling_texts,
-        device=device,
-        batch_size=args.embed_batch_size,
-        max_length=args.embed_max_length,
-        news_encoder=args.news_encoder,
-        finbert_model_name=args.finbert_model_name,
-        local_files_only=args.local_files_only,
-        output_dir=args.output_dir,
-        cache_prefix=f"rolling{args.rolling_news_lookback_days}d_news_embeddings",
-    )
-    print(f"Rolling news embedding dim: {text_embs.shape[1]}")
+    if needs_news_embeddings:
+        print("Preparing rolling news embeddings...")
+        text_embs = build_news_embeddings(
+            texts=rolling_texts,
+            device=device,
+            batch_size=args.embed_batch_size,
+            max_length=args.embed_max_length,
+            news_encoder=args.news_encoder,
+            finbert_model_name=args.finbert_model_name,
+            local_files_only=args.local_files_only,
+            output_dir=args.output_dir,
+            cache_prefix=f"rolling{args.rolling_news_lookback_days}d_news_embeddings",
+            cache_metadata={
+                "texts_sha256": texts_fingerprint(rolling_texts),
+                "lookback_days": int(args.rolling_news_lookback_days),
+                "restrict_to_month": bool(not args.allow_news_cross_month),
+                "data_start_date": df[DATE_COL].min().date().isoformat(),
+                "data_end_date": df[DATE_COL].max().date().isoformat(),
+            },
+        )
+        print(f"Rolling news embedding dim: {text_embs.shape[1]}")
+    else:
+        text_embs = np.zeros((len(df), 1), dtype=np.float32)
+        print("Skipping text embeddings because only numeric_only ablation was requested.")
 
     numeric_features = get_stock_time_series_features(df)
     X_num_raw = df[numeric_features].apply(pd.to_numeric, errors="coerce")
@@ -941,7 +997,6 @@ def main() -> None:
     else:
         print("Identity features disabled.")
 
-    ablations = parse_ablations(args.ablations)
     rows: list[dict] = []
     prediction_frames: list[pd.DataFrame] = []
 
