@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,6 +21,18 @@ DATE_COL = "date"
 TICKER_COL = "ticker"
 CLASS_TARGET_COL = "target_up_down"
 TEXT_COLS = ["all_headlines", "all_summaries", "all_news_text"]
+NEWS_NUMERIC_COLS = {
+    "news_count",
+    "unique_sources",
+    "author_count",
+    "has_news",
+    "headline_char_len",
+    "news_text_char_len",
+    "rolling_news_count",
+    "rolling_news_days",
+    "rolling_has_news",
+    "news_age_days",
+}
 
 EXCLUDE_COLS = {
     DATE_COL,
@@ -151,20 +164,117 @@ def compose_text(df: pd.DataFrame) -> list[str]:
     return texts
 
 
+def compose_rolling_news_texts(
+    df: pd.DataFrame,
+    lookback_days: int,
+    restrict_to_month: bool,
+) -> tuple[list[str], pd.DataFrame]:
+    """Build ticker-local rolling news text ending at each row's date."""
+    texts = [""] * len(df)
+    coverage_rows: list[dict] = []
+
+    sorted_df = df.sort_values([TICKER_COL, DATE_COL]).copy()
+    for ticker, group in sorted_df.groupby(TICKER_COL, sort=False):
+        window: deque[tuple[pd.Timestamp, str, int]] = deque()
+        for row_idx, row in group.iterrows():
+            current_date = pd.to_datetime(row[DATE_COL]).normalize()
+            window_start = current_date - pd.Timedelta(days=lookback_days)
+            if restrict_to_month:
+                month_start = current_date.replace(day=1)
+                window_start = max(window_start, month_start)
+
+            while window and window[0][0] < window_start:
+                window.popleft()
+
+            day_text = compose_text(pd.DataFrame([row]))[0]
+            day_news_count_raw = pd.to_numeric(row.get("news_count", 0), errors="coerce")
+            day_news_count = 0 if pd.isna(day_news_count_raw) else int(day_news_count_raw)
+            if day_text and day_news_count > 0:
+                window.append((current_date, day_text, day_news_count))
+
+            rolling_parts = [item[1] for item in window]
+            rolling_text = " ".join(rolling_parts).strip()
+            rolling_count = int(sum(item[2] for item in window))
+            news_days = int(len({item[0] for item in window}))
+            last_news_date = window[-1][0] if window else pd.NaT
+            news_age_days = (
+                int((current_date - last_news_date).days) if pd.notna(last_news_date) else lookback_days + 1
+            )
+
+            texts[row_idx] = rolling_text
+            coverage_rows.append(
+                {
+                    "row_idx": int(row_idx),
+                    "ticker": ticker,
+                    "date": current_date,
+                    "rolling_news_count": rolling_count,
+                    "rolling_news_days": news_days,
+                    "rolling_has_news": int(rolling_count > 0),
+                    "news_age_days": news_age_days,
+                    "window_start": window_start,
+                    "window_end": current_date,
+                }
+            )
+
+    coverage = pd.DataFrame(coverage_rows).set_index("row_idx").sort_index()
+    return texts, coverage
+
+
+def print_and_save_news_coverage(coverage: pd.DataFrame, output_dir: str) -> None:
+    overall = {
+        "rows": int(len(coverage)),
+        "rows_with_rolling_news": int(coverage["rolling_has_news"].sum()),
+        "coverage_rate": float(coverage["rolling_has_news"].mean()) if len(coverage) else 0.0,
+        "median_news_age_days": float(coverage["news_age_days"].median()) if len(coverage) else float("nan"),
+        "mean_rolling_news_count": float(coverage["rolling_news_count"].mean()) if len(coverage) else 0.0,
+    }
+    by_ticker = (
+        coverage.groupby("ticker", as_index=False)
+        .agg(
+            rows=("rolling_has_news", "size"),
+            coverage_rate=("rolling_has_news", "mean"),
+            mean_rolling_news_count=("rolling_news_count", "mean"),
+            median_news_age_days=("news_age_days", "median"),
+        )
+        .sort_values(["coverage_rate", "mean_rolling_news_count"], ascending=[True, True])
+    )
+
+    coverage_path = os.path.join(output_dir, "rolling_news_coverage_by_ticker.csv")
+    by_ticker.to_csv(coverage_path, index=False)
+
+    print(
+        "Rolling news coverage: "
+        f"{overall['rows_with_rolling_news']:,}/{overall['rows']:,} rows "
+        f"({overall['coverage_rate']:.2%}), "
+        f"median age={overall['median_news_age_days']:.1f} days, "
+        f"mean articles/window={overall['mean_rolling_news_count']:.2f}"
+    )
+    print("Lowest coverage tickers:")
+    print(by_ticker.head(10).to_string(index=False))
+    print(f"Saved news coverage: {coverage_path}")
+
+
 def embedding_cache_paths(
     output_dir: str,
     n_rows: int,
     encoder_key: str,
     max_length: int,
+    cache_prefix: str = "text_embeddings",
 ) -> tuple[str, str]:
     stem = f"{safe_slug(encoder_key)}_L{max_length}_N{n_rows}"
-    emb_path = os.path.join(output_dir, f"text_embeddings_{stem}.npy")
-    meta_path = os.path.join(output_dir, f"text_embeddings_{stem}.meta.json")
+    emb_path = os.path.join(output_dir, f"{cache_prefix}_{stem}.npy")
+    meta_path = os.path.join(output_dir, f"{cache_prefix}_{stem}.meta.json")
     return emb_path, meta_path
 
 
-def load_cached_embeddings(output_dir: str, n_rows: int, encoder_key: str, max_length: int) -> np.ndarray | None:
-    emb_path, meta_path = embedding_cache_paths(output_dir, n_rows, encoder_key, max_length)
+def load_cached_embeddings(
+    output_dir: str,
+    n_rows: int,
+    encoder_key: str,
+    max_length: int,
+    cache_prefix: str = "text_embeddings",
+) -> np.ndarray | None:
+    emb_path, meta_path = embedding_cache_paths(output_dir, n_rows, encoder_key, max_length, cache_prefix)
     if not (os.path.exists(emb_path) and os.path.exists(meta_path)):
         return None
     try:
@@ -182,8 +292,9 @@ def save_cached_embeddings(
     encoder_key: str,
     max_length: int,
     embs: np.ndarray,
+    cache_prefix: str = "text_embeddings",
 ) -> None:
-    emb_path, meta_path = embedding_cache_paths(output_dir, embs.shape[0], encoder_key, max_length)
+    emb_path, meta_path = embedding_cache_paths(output_dir, embs.shape[0], encoder_key, max_length, cache_prefix)
     np.save(emb_path, embs)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -192,6 +303,7 @@ def save_cached_embeddings(
                 "dim": int(embs.shape[1]),
                 "encoder_key": encoder_key,
                 "max_length": int(max_length),
+                "cache_prefix": cache_prefix,
             },
             f,
             indent=2,
@@ -237,6 +349,7 @@ def build_news_embeddings(
     finbert_model_name: str,
     local_files_only: bool,
     output_dir: str,
+    cache_prefix: str = "text_embeddings",
 ) -> np.ndarray:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -244,7 +357,7 @@ def build_news_embeddings(
     finbert_key = safe_slug(finbert_model_name)
 
     def get_gpt2_embs() -> np.ndarray:
-        cached = load_cached_embeddings(output_dir, len(texts), gpt2_key, max_length)
+        cached = load_cached_embeddings(output_dir, len(texts), gpt2_key, max_length, cache_prefix)
         if cached is not None:
             print("Using cached GPT-2 embeddings.")
             return cached
@@ -253,18 +366,18 @@ def build_news_embeddings(
             tokenizer.pad_token = tokenizer.eos_token
         model = GPT2Model.from_pretrained("gpt2", local_files_only=local_files_only).to(device)
         embs = embed_text_with_model(texts, tokenizer, model, device, batch_size, max_length, "gpt2")
-        save_cached_embeddings(output_dir, gpt2_key, max_length, embs)
+        save_cached_embeddings(output_dir, gpt2_key, max_length, embs, cache_prefix)
         return embs
 
     def get_finbert_embs() -> np.ndarray:
-        cached = load_cached_embeddings(output_dir, len(texts), finbert_key, max_length)
+        cached = load_cached_embeddings(output_dir, len(texts), finbert_key, max_length, cache_prefix)
         if cached is not None:
             print(f"Using cached {finbert_model_name} embeddings.")
             return cached
         tokenizer = AutoTokenizer.from_pretrained(finbert_model_name, local_files_only=local_files_only)
         model = AutoModel.from_pretrained(finbert_model_name, local_files_only=local_files_only).to(device)
         embs = embed_text_with_model(texts, tokenizer, model, device, batch_size, max_length, "finbert")
-        save_cached_embeddings(output_dir, finbert_key, max_length, embs)
+        save_cached_embeddings(output_dir, finbert_key, max_length, embs, cache_prefix)
         return embs
 
     if news_encoder == "gpt2":
@@ -281,6 +394,10 @@ def build_news_embeddings(
 def get_numeric_features(df: pd.DataFrame) -> list[str]:
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     return [c for c in numeric_cols if c not in EXCLUDE_COLS]
+
+
+def get_stock_time_series_features(df: pd.DataFrame) -> list[str]:
+    return [c for c in get_numeric_features(df) if c not in NEWS_NUMERIC_COLS]
 
 
 def qcut_labels(values: pd.Series, n_bins: int = 3) -> pd.Series:
@@ -383,6 +500,152 @@ class TabularClassifier(nn.Module):
         return self.net(x)
 
 
+@dataclass
+class PanelData:
+    dates: np.ndarray
+    tickers: list[str]
+    stock_x: np.ndarray
+    news_x: np.ndarray
+    cat_x: np.ndarray | None
+    y: np.ndarray
+    mask: np.ndarray
+
+
+class MultiStockFusionClassifier(nn.Module):
+    def __init__(
+        self,
+        stock_dim: int,
+        news_dim: int,
+        cat_cardinalities: list[int],
+        hidden_dim: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 1,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.stock_encoder = nn.LSTM(stock_dim, hidden_dim, batch_first=True)
+        self.news_proj = nn.Sequential(
+            nn.Linear(news_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.emb_layers = nn.ModuleList()
+        cat_total = 0
+        for card in cat_cardinalities:
+            dim = max(2, min(16, int(np.ceil(np.sqrt(max(2, card))))))
+            self.emb_layers.append(nn.Embedding(card, dim))
+            cat_total += dim
+        self.cat_proj = nn.Linear(cat_total, hidden_dim) if cat_total > 0 else None
+
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.cross_ticker_encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.out = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        stock_x: torch.Tensor,
+        news_x: torch.Tensor,
+        cat_x: torch.Tensor | None = None,
+        use_stock: bool = True,
+        use_news: bool = True,
+    ) -> torch.Tensor:
+        batch_size, n_tickers, seq_len, stock_dim = stock_x.shape
+
+        if use_stock:
+            stock_flat = stock_x.reshape(batch_size * n_tickers, seq_len, stock_dim)
+            _, (stock_h, _) = self.stock_encoder(stock_flat)
+            stock_h = stock_h[-1].reshape(batch_size, n_tickers, self.hidden_dim)
+        else:
+            stock_h = stock_x.new_zeros(batch_size, n_tickers, self.hidden_dim)
+
+        if use_news:
+            news_h = self.news_proj(news_x)
+        else:
+            news_h = news_x.new_zeros(batch_size, n_tickers, self.hidden_dim)
+
+        if cat_x is not None and len(self.emb_layers) > 0:
+            cat_chunks = [emb(cat_x[:, i]) for i, emb in enumerate(self.emb_layers)]
+            cat_h = self.cat_proj(torch.cat(cat_chunks, dim=1))
+            cat_h = cat_h.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            cat_h = stock_x.new_zeros(batch_size, n_tickers, self.hidden_dim)
+
+        fused = self.fuse(torch.cat([stock_h, news_h, cat_h], dim=-1))
+        encoded = self.cross_ticker_encoder(fused)
+        return self.out(encoded).squeeze(-1)
+
+
+def build_panel_data(
+    df: pd.DataFrame,
+    stock_matrix: np.ndarray,
+    news_matrix: np.ndarray,
+    y: np.ndarray,
+    cat_matrix: np.ndarray | None,
+    seq_len: int,
+) -> PanelData:
+    dates_index = pd.DatetimeIndex(pd.to_datetime(df[DATE_COL]).dt.normalize().unique()).sort_values()
+    dates = dates_index.to_numpy(dtype="datetime64[ns]")
+    tickers = sorted(df[TICKER_COL].dropna().unique().tolist())
+    date_to_i = {pd.Timestamp(d).normalize(): i for i, d in enumerate(dates_index)}
+    ticker_to_i = {t: i for i, t in enumerate(tickers)}
+
+    row_grid = np.full((len(dates), len(tickers)), -1, dtype=np.int64)
+    for row_idx, row in df.iterrows():
+        d = pd.to_datetime(row[DATE_COL]).normalize()
+        t = row[TICKER_COL]
+        row_grid[date_to_i[d], ticker_to_i[t]] = int(row_idx)
+
+    sample_date_indices = list(range(seq_len - 1, len(dates)))
+    n_samples = len(sample_date_indices)
+    n_tickers = len(tickers)
+    stock_x = np.zeros((n_samples, n_tickers, seq_len, stock_matrix.shape[1]), dtype=np.float32)
+    news_x = np.zeros((n_samples, n_tickers, news_matrix.shape[1]), dtype=np.float32)
+    y_panel = np.zeros((n_samples, n_tickers), dtype=np.float32)
+    mask = np.zeros((n_samples, n_tickers), dtype=bool)
+
+    for sample_i, date_i in enumerate(sample_date_indices):
+        window_rows = row_grid[date_i - seq_len + 1 : date_i + 1]
+        current_rows = row_grid[date_i]
+        for ticker_i in range(n_tickers):
+            seq_rows = window_rows[:, ticker_i]
+            available_steps = seq_rows >= 0
+            if available_steps.any():
+                stock_x[sample_i, ticker_i, available_steps] = stock_matrix[seq_rows[available_steps]]
+
+            current_row = current_rows[ticker_i]
+            if current_row >= 0 and np.isfinite(y[current_row]):
+                news_x[sample_i, ticker_i] = news_matrix[current_row]
+                y_panel[sample_i, ticker_i] = y[current_row]
+                mask[sample_i, ticker_i] = True
+
+    panel_dates = dates[np.array(sample_date_indices)]
+    cat_x = None
+    if cat_matrix is not None:
+        cat_x = np.zeros((n_tickers, cat_matrix.shape[1]), dtype=np.int64)
+        for ticker_i in range(n_tickers):
+            first_row = row_grid[:, ticker_i][row_grid[:, ticker_i] >= 0][0]
+            cat_x[ticker_i] = cat_matrix[first_row]
+
+    return PanelData(panel_dates, tickers, stock_x, news_x.astype(np.float32), cat_x, y_panel, mask)
+
+
 def best_threshold_by_f1(y_true: np.ndarray, probs: np.ndarray) -> float:
     y_true_int = y_true.astype(int)
     best_t, best_f1, best_bal = 0.5, -1.0, -1.0
@@ -469,6 +732,114 @@ def train_classifier(
     return metrics
 
 
+def train_panel_classifier(
+    panel: PanelData,
+    train_sample_idx: np.ndarray,
+    test_sample_idx: np.ndarray,
+    ablation: str,
+    device: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    hidden_dim: int,
+    n_heads: int,
+    n_layers: int,
+) -> tuple[dict, pd.DataFrame]:
+    use_stock = ablation in {"numeric_only", "fusion"}
+    use_news = ablation in {"news_only", "fusion"}
+
+    cat_cardinalities: list[int] = []
+    if panel.cat_x is not None:
+        for i in range(panel.cat_x.shape[1]):
+            cat_cardinalities.append(int(panel.cat_x[:, i].max() + 1))
+
+    model = MultiStockFusionClassifier(
+        stock_dim=panel.stock_x.shape[-1],
+        news_dim=panel.news_x.shape[-1],
+        cat_cardinalities=cat_cardinalities,
+        hidden_dim=hidden_dim,
+        n_heads=n_heads,
+        n_layers=n_layers,
+    ).to(device)
+
+    train_y_valid = panel.y[train_sample_idx][panel.mask[train_sample_idx]]
+    pos_count = float(np.sum(train_y_valid > 0.5))
+    neg_count = float(len(train_y_valid) - pos_count)
+    if pos_count > 0:
+        pos_weight = torch.tensor([neg_count / pos_count], dtype=torch.float32, device=device)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    else:
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    stock_t = torch.tensor(panel.stock_x, dtype=torch.float32, device=device)
+    news_t = torch.tensor(panel.news_x, dtype=torch.float32, device=device)
+    y_t = torch.tensor(panel.y, dtype=torch.float32, device=device)
+    mask_t = torch.tensor(panel.mask, dtype=torch.bool, device=device)
+    cat_t = torch.tensor(panel.cat_x, dtype=torch.long, device=device) if panel.cat_x is not None else None
+    train_idx_t = torch.tensor(train_sample_idx, dtype=torch.long, device=device)
+    test_idx_t = torch.tensor(test_sample_idx, dtype=torch.long, device=device)
+
+    model.train()
+    for _ in range(epochs):
+        perm = train_idx_t[torch.randperm(train_idx_t.numel(), device=device)]
+        for i in range(0, perm.numel(), batch_size):
+            idx = perm[i : i + batch_size]
+            xb_stock = stock_t[idx]
+            xb_news = news_t[idx]
+            yb = y_t[idx]
+            mb = mask_t[idx]
+            if not mb.any():
+                continue
+
+            opt.zero_grad()
+            logits = model(xb_stock, xb_news, cat_t, use_stock=use_stock, use_news=use_news)
+            loss_matrix = loss_fn(logits, yb)
+            loss = loss_matrix[mb].mean()
+            loss.backward()
+            opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(
+            stock_t[test_idx_t],
+            news_t[test_idx_t],
+            cat_t,
+            use_stock=use_stock,
+            use_news=use_news,
+        )
+        probs_panel = torch.sigmoid(logits).cpu().numpy()
+
+    y_panel = panel.y[test_sample_idx]
+    mask_panel = panel.mask[test_sample_idx]
+    y_test = y_panel[mask_panel]
+    probs = probs_panel[mask_panel]
+    threshold = best_threshold_by_f1(y_test, probs)
+    metrics = classification_metrics(y_test, probs, threshold)
+    metrics["train_pos_rate"] = float(np.mean(train_y_valid)) if len(train_y_valid) else float("nan")
+    metrics["test_pos_rate"] = float(np.mean(y_test)) if len(y_test) else float("nan")
+
+    pred_rows: list[dict] = []
+    for local_i, sample_i in enumerate(test_sample_idx):
+        date = pd.to_datetime(panel.dates[sample_i]).date().isoformat()
+        for ticker_i, ticker in enumerate(panel.tickers):
+            if not mask_panel[local_i, ticker_i]:
+                continue
+            prob = float(probs_panel[local_i, ticker_i])
+            pred_rows.append(
+                {
+                    "date": date,
+                    "ticker": ticker,
+                    "y_true": int(y_panel[local_i, ticker_i]),
+                    "prob_up": prob,
+                    "pred_up_down": int(prob >= threshold),
+                }
+            )
+
+    return metrics, pd.DataFrame(pred_rows)
+
+
 def parse_ablations(raw: str) -> list[str]:
     values = [v.strip() for v in raw.split(",") if v.strip()]
     allowed = {"numeric_only", "news_only", "fusion"}
@@ -488,8 +859,14 @@ def main() -> None:
     parser.add_argument("--walk_splits", type=int, default=5)
     parser.add_argument("--min_train_ratio", type=float, default=0.6)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=8e-4)
+    parser.add_argument("--seq_len", type=int, default=20, help="Trading-day stock history length per ticker")
+    parser.add_argument("--rolling_news_lookback_days", type=int, default=28)
+    parser.add_argument("--allow_news_cross_month", action="store_true")
+    parser.add_argument("--panel_hidden_dim", type=int, default=128)
+    parser.add_argument("--panel_heads", type=int, default=4)
+    parser.add_argument("--panel_layers", type=int, default=1)
 
     parser.add_argument("--news_encoder", type=str, default="both", choices=["gpt2", "finbert", "both"])
     parser.add_argument("--finbert_model_name", type=str, default="ProsusAI/finbert")
@@ -505,6 +882,8 @@ def main() -> None:
 
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.panel_hidden_dim % args.panel_heads != 0:
+        raise ValueError("--panel_hidden_dim must be divisible by --panel_heads")
 
     print("Loading dataset...")
     max_rows = None if args.max_rows <= 0 else args.max_rows
@@ -516,12 +895,21 @@ def main() -> None:
     folds = build_walk_forward_splits(df, n_splits=args.walk_splits, min_train_ratio=args.min_train_ratio)
     print(f"Walk-forward folds: {len(folds)}")
 
-    print("Preparing text embeddings...")
-    texts = compose_text(df)
+    print("Preparing rolling news windows...")
+    rolling_texts, coverage = compose_rolling_news_texts(
+        df,
+        lookback_days=args.rolling_news_lookback_days,
+        restrict_to_month=not args.allow_news_cross_month,
+    )
+    for col in ["rolling_news_count", "rolling_news_days", "rolling_has_news", "news_age_days"]:
+        df[col] = coverage[col].to_numpy()
+    print_and_save_news_coverage(coverage, args.output_dir)
+
+    print("Preparing rolling news embeddings...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     text_embs = build_news_embeddings(
-        texts=texts,
+        texts=rolling_texts,
         device=device,
         batch_size=args.embed_batch_size,
         max_length=args.embed_max_length,
@@ -529,14 +917,16 @@ def main() -> None:
         finbert_model_name=args.finbert_model_name,
         local_files_only=args.local_files_only,
         output_dir=args.output_dir,
+        cache_prefix=f"rolling{args.rolling_news_lookback_days}d_news_embeddings",
     )
-    print(f"Text embedding dim: {text_embs.shape[1]}")
+    print(f"Rolling news embedding dim: {text_embs.shape[1]}")
 
-    numeric_features = get_numeric_features(df)
+    numeric_features = get_stock_time_series_features(df)
     X_num_raw = df[numeric_features].apply(pd.to_numeric, errors="coerce")
     X_num_raw = X_num_raw.replace([np.inf, -np.inf], np.nan)
     X_num_raw = X_num_raw.fillna(X_num_raw.median(numeric_only=True)).fillna(0.0).to_numpy(dtype=np.float32)
     y = df[CLASS_TARGET_COL].astype(np.float32).to_numpy()
+    print(f"Historical stock feature dim: {len(numeric_features)}")
 
     cat_matrix = None
     identity_vocab = {}
@@ -553,6 +943,7 @@ def main() -> None:
 
     ablations = parse_ablations(args.ablations)
     rows: list[dict] = []
+    prediction_frames: list[pd.DataFrame] = []
 
     for fold in folds:
         print(
@@ -561,39 +952,53 @@ def main() -> None:
         )
         scaler = StandardScaler()
         X_num_train = scaler.fit_transform(X_num_raw[fold.train_idx])
-        X_num_test = scaler.transform(X_num_raw[fold.test_idx])
+        X_num_scaled = X_num_raw.copy()
+        X_num_scaled[fold.train_idx] = X_num_train
+        not_train_idx = np.setdiff1d(np.arange(len(df)), fold.train_idx)
+        X_num_scaled[not_train_idx] = scaler.transform(X_num_raw[not_train_idx])
 
-        X_text_train = text_embs[fold.train_idx]
-        X_text_test = text_embs[fold.test_idx]
+        panel = build_panel_data(
+            df=df,
+            stock_matrix=X_num_scaled,
+            news_matrix=text_embs,
+            y=y,
+            cat_matrix=cat_matrix,
+            seq_len=args.seq_len,
+        )
+        train_sample_idx = np.where(panel.dates <= np.datetime64(fold.train_end_date.normalize()))[0]
+        test_sample_idx = np.where(
+            (panel.dates >= np.datetime64(fold.test_start_date.normalize()))
+            & (panel.dates <= np.datetime64(fold.test_end_date.normalize()))
+        )[0]
+        if len(train_sample_idx) == 0 or len(test_sample_idx) == 0:
+            print("  Skipping fold because no panel samples are available after seq_len filtering.")
+            continue
 
-        y_train = y[fold.train_idx]
-        y_test = y[fold.test_idx]
-
-        train_cat = cat_matrix[fold.train_idx] if cat_matrix is not None else None
-        test_cat = cat_matrix[fold.test_idx] if cat_matrix is not None else None
+        n_train_outputs = int(panel.mask[train_sample_idx].sum())
+        n_test_outputs = int(panel.mask[test_sample_idx].sum())
+        print(
+            f"  Panel samples: train dates={len(train_sample_idx)}, test dates={len(test_sample_idx)}, "
+            f"tickers={len(panel.tickers)}, train outputs={n_train_outputs}, test outputs={n_test_outputs}"
+        )
 
         for ablation in ablations:
-            if ablation == "numeric_only":
-                X_train, X_test = X_num_train, X_num_test
-            elif ablation == "news_only":
-                X_train, X_test = X_text_train, X_text_test
-            else:
-                X_train = np.hstack([X_num_train, X_text_train]).astype(np.float32)
-                X_test = np.hstack([X_num_test, X_text_test]).astype(np.float32)
-
             print(f"  Training ablation: {ablation}")
-            metrics = train_classifier(
-                X_train=X_train,
-                y_train=y_train,
-                X_test=X_test,
-                y_test=y_test,
-                train_cat=train_cat,
-                test_cat=test_cat,
+            metrics, pred_df = train_panel_classifier(
+                panel=panel,
+                train_sample_idx=train_sample_idx,
+                test_sample_idx=test_sample_idx,
+                ablation=ablation,
                 device=device,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 lr=args.lr,
+                hidden_dim=args.panel_hidden_dim,
+                n_heads=args.panel_heads,
+                n_layers=args.panel_layers,
             )
+            pred_df.insert(0, "ablation", ablation)
+            pred_df.insert(0, "fold", fold.fold)
+            prediction_frames.append(pred_df)
 
             row = {
                 "fold": fold.fold,
@@ -601,8 +1006,10 @@ def main() -> None:
                 "train_end_date": fold.train_end_date.date().isoformat(),
                 "test_start_date": fold.test_start_date.date().isoformat(),
                 "test_end_date": fold.test_end_date.date().isoformat(),
-                "n_train": int(len(fold.train_idx)),
-                "n_test": int(len(fold.test_idx)),
+                "n_train_dates": int(len(train_sample_idx)),
+                "n_test_dates": int(len(test_sample_idx)),
+                "n_train_outputs": n_train_outputs,
+                "n_test_outputs": n_test_outputs,
                 **metrics,
             }
             rows.append(row)
@@ -632,12 +1039,15 @@ def main() -> None:
 
     fold_path = os.path.join(args.output_dir, "gpt2_mmflib_classification_fold_metrics.csv")
     summary_path = os.path.join(args.output_dir, "gpt2_mmflib_metrics.csv")
+    pred_path = os.path.join(args.output_dir, "gpt2_mmflib_panel_predictions.csv")
     config_path = os.path.join(args.output_dir, "gpt2_mmflib_run_config.json")
     features_path = os.path.join(args.output_dir, "numeric_features.json")
     vocab_path = os.path.join(args.output_dir, "identity_vocab.json")
 
     fold_df.to_csv(fold_path, index=False)
     summary.to_csv(summary_path, index=False)
+    if prediction_frames:
+        pd.concat(prediction_frames, ignore_index=True).to_csv(pred_path, index=False)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
     with open(features_path, "w", encoding="utf-8") as f:
@@ -650,6 +1060,8 @@ def main() -> None:
     print(summary.to_string(index=False))
     print(f"\nSaved fold metrics: {fold_path}")
     print(f"Saved summary metrics: {summary_path}")
+    if prediction_frames:
+        print(f"Saved per-stock panel predictions: {pred_path}")
     print(f"Saved config: {config_path}")
 
 
