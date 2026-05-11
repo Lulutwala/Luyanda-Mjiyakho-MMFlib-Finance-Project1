@@ -551,6 +551,27 @@ class PanelData:
     mask: np.ndarray
 
 
+def save_panel_metadata(panel: PanelData, output_dir: str, seq_len: int, stock_features: list[str]) -> None:
+    meta_path = os.path.join(output_dir, "panel_metadata.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "seq_len": int(seq_len),
+                "n_panel_dates": int(len(panel.dates)),
+                "n_tickers": int(len(panel.tickers)),
+                "tickers": panel.tickers,
+                "stock_features": stock_features,
+                "stock_x_shape": list(panel.stock_x.shape),
+                "news_x_shape": list(panel.news_x.shape),
+                "target_shape": list(panel.y.shape),
+                "valid_output_count": int(panel.mask.sum()),
+            },
+            f,
+            indent=2,
+        )
+    print(f"Saved panel metadata: {meta_path}")
+
+
 class MultiStockFusionClassifier(nn.Module):
     def __init__(
         self,
@@ -999,6 +1020,7 @@ def main() -> None:
 
     rows: list[dict] = []
     prediction_frames: list[pd.DataFrame] = []
+    saved_panel_metadata = False
 
     for fold in folds:
         print(
@@ -1020,6 +1042,9 @@ def main() -> None:
             cat_matrix=cat_matrix,
             seq_len=args.seq_len,
         )
+        if not saved_panel_metadata:
+            save_panel_metadata(panel, args.output_dir, args.seq_len, numeric_features)
+            saved_panel_metadata = True
         train_sample_idx = np.where(panel.dates <= np.datetime64(fold.train_end_date.normalize()))[0]
         test_sample_idx = np.where(
             (panel.dates >= np.datetime64(fold.test_start_date.normalize()))
@@ -1077,6 +1102,11 @@ def main() -> None:
             )
 
     fold_df = pd.DataFrame(rows)
+    if fold_df.empty:
+        raise RuntimeError(
+            "No panel folds were trained. Reduce --seq_len, increase --max_rows, or check that the dataset has "
+            "enough dates after walk-forward splitting."
+        )
     summary = (
         fold_df.groupby("ablation", as_index=False)
         .agg(
@@ -1112,13 +1142,4 @@ def main() -> None:
             json.dump(identity_vocab, f, indent=2)
 
     print("\nAblation summary (walk-forward):")
-    print(summary.to_string(index=False))
-    print(f"\nSaved fold metrics: {fold_path}")
-    print(f"Saved summary metrics: {summary_path}")
-    if prediction_frames:
-        print(f"Saved per-stock panel predictions: {pred_path}")
-    print(f"Saved config: {config_path}")
-
-
-if __name__ == "__main__":
-    main()
+    print(summary.t

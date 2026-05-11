@@ -14,13 +14,29 @@ from typing import List
 import os
 
 # --- CONFIGURATION ---
-OUTPUT_DIR = r"D:\MASTERS\Luyanda Mjiyakho Project1\Luyanda-Mjiyakho-MMFlib-Finance-Project1\data\Economy"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "Economy")
 OUTPUT_FILENAME = os.path.join(OUTPUT_DIR, 'mmflib_stock_features.csv')
+SYMBOL_CSV_PATH = os.path.join(PROJECT_ROOT, "nasdaq-listed-symbols.csv")
 
-START_DATE = '2015-01-01'
-END_DATE = pd.Timestamp.now().strftime('%Y-%m-%d')
+START_DATE = '2020-01-01'
+# yfinance treats `end` as exclusive, so add one day to include today's latest daily bar when available.
+END_DATE = (pd.Timestamp.now() + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
 BATCH_THREADS = True
+DOWNLOAD_BATCH_SIZE = 200
+SKIP_TEST_ISSUES = False
+SKIP_ETFS = False
+STOCKS_ONLY = False
 PRIOR_HISTORY_WINDOW = 30
+
+STOCK_SECURITY_PATTERNS = (
+    "COMMON STOCK",
+    "COMMON SHARES",
+    "ORDINARY SHARES",
+    "AMERICAN DEPOSITARY SHARES",
+    "AMERICAN DEPOSITORY SHARES",
+    "ADS",
+)
 
 #to match the columns in the existing economy data#
 MMFLIB_COLUMNS = [
@@ -32,14 +48,47 @@ MMFLIB_COLUMNS = [
 ]
 
 # --- HELPERS ---
-def get_sp500_tickers() -> List[str]:
-    try:
-        tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
-        df = tables[0]
-        tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()
-        return tickers
-    except Exception:
-        return ["AAPL","MSFT","GOOGL","AMZN","NVDA","JPM","V"]
+def load_symbols_from_csv(path: str = SYMBOL_CSV_PATH) -> List[str]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Symbol CSV not found: {path}")
+
+    df = pd.read_csv(path)
+    symbol_col = next((col for col in ("Symbol", "symbol", "Ticker", "ticker", "symbols") if col in df.columns), None)
+    if symbol_col is None:
+        raise ValueError(f"No symbol column found in {path}")
+
+    if SKIP_TEST_ISSUES and "Test Issue" in df.columns:
+        df = df[df["Test Issue"].fillna("N").astype(str).str.upper() != "Y"]
+
+    if SKIP_ETFS and "ETF" in df.columns:
+        df = df[df["ETF"].fillna("N").astype(str).str.upper() != "Y"]
+
+    if STOCKS_ONLY and "Security Name" in df.columns:
+        security_names = df["Security Name"].fillna("").astype(str).str.upper()
+        stock_mask = False
+        for pattern in STOCK_SECURITY_PATTERNS:
+            stock_mask = stock_mask | security_names.str.contains(pattern, regex=False)
+        df = df[stock_mask]
+
+    symbols = (
+        df[symbol_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+    symbols = symbols[symbols.str.fullmatch(r"[A-Z0-9.-]+")]
+    symbols = symbols.str.replace(".", "-", regex=False)
+    symbols = symbols.drop_duplicates().sort_values().tolist()
+
+    if not symbols:
+        raise ValueError(f"No symbols found in {path}")
+    return symbols
+
+
+def chunked(items: List[str], size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -108,7 +157,7 @@ def batch_download_and_build(tickers: List[str], start_date: str, end_date: str)
 
         tdf = tdf.sort_values('date').reset_index(drop=True)
         tdf['log_return'] = np.log(tdf['close_used'] / tdf['close_used'].shift(1))
-        tdf['pct_change'] = tdf['close_used'].pct_change()
+        tdf['pct_change'] = tdf['close_used'].pct_change(fill_method=None)
 
         # Lags 1..7
         for lag in range(1,8):
@@ -144,8 +193,8 @@ def batch_download_and_build(tickers: List[str], start_date: str, end_date: str)
         tdf['Exports'] = np.nan
         tdf['Imports'] = np.nan
         tdf['OT'] = np.nan
-        tdf['start_date'] = START_DATE
-        tdf['end_date'] = END_DATE
+        tdf['start_date'] = start_date
+        tdf['end_date'] = end_date
 
         # Stock symbol column
         tdf['ticker'] = t
@@ -172,15 +221,64 @@ def batch_download_and_build(tickers: List[str], start_date: str, end_date: str)
 
     return combined
 
+
+def download_and_build_all(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    frames = []
+    ticker_batches = list(chunked(tickers, DOWNLOAD_BATCH_SIZE))
+
+    for batch_number, ticker_batch in enumerate(ticker_batches, start=1):
+        print(f"Processing batch {batch_number}/{len(ticker_batches)}")
+        try:
+            frames.append(batch_download_and_build(ticker_batch, start_date, end_date))
+        except Exception as exc:
+            print(f"Skipping batch {batch_number}: {exc}")
+
+    if not frames:
+        raise RuntimeError("No valid ticker data was downloaded.")
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def download_and_save_all(tickers: List[str], start_date: str, end_date: str, output_filename: str) -> int:
+    ticker_batches = list(chunked(tickers, DOWNLOAD_BATCH_SIZE))
+    temp_filename = f"{output_filename}.tmp"
+    total_rows = 0
+    wrote_header = False
+
+    if os.path.exists(temp_filename):
+        os.remove(temp_filename)
+
+    for batch_number, ticker_batch in enumerate(ticker_batches, start=1):
+        print(f"Processing batch {batch_number}/{len(ticker_batches)}")
+        try:
+            batch_df = batch_download_and_build(ticker_batch, start_date, end_date)
+        except Exception as exc:
+            print(f"Skipping batch {batch_number}: {exc}")
+            continue
+
+        batch_df.to_csv(
+            temp_filename,
+            mode="w" if not wrote_header else "a",
+            header=not wrote_header,
+            index=False,
+        )
+        wrote_header = True
+        total_rows += len(batch_df)
+        print(f"Saved batch {batch_number}; total rows so far: {total_rows}")
+
+    if not wrote_header:
+        raise RuntimeError("No valid ticker data was downloaded.")
+
+    os.replace(temp_filename, output_filename)
+    return total_rows
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    tickers = get_sp500_tickers()
-    df = batch_download_and_build(tickers, START_DATE, END_DATE)
-    df.to_csv(OUTPUT_FILENAME, index=False)
+    tickers = load_symbols_from_csv()
+    print(f"Loaded {len(tickers)} symbols from {SYMBOL_CSV_PATH}")
+    row_count = download_and_save_all(tickers, START_DATE, END_DATE, OUTPUT_FILENAME)
     print(f"✅ Saved features to {OUTPUT_FILENAME}")
-    print(f"Shape: {df.shape}")
-    print("Columns:")
-    print(df.columns.tolist())
+    print(f"Rows: {row_count}")
 
 if __name__ == "__main__":
     main()
